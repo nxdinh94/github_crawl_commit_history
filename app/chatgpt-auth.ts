@@ -64,7 +64,8 @@ function safeRelativeReturnPath(value: string): string {
   let url: URL;
   try {
     url = new URL(value, "https://app.local");
-  } catch {
+  } catch (error) {
+    console.error("[auth] Failed to parse return path", error);
     return "/";
   }
   if (url.origin !== "https://app.local") return "/";
@@ -84,7 +85,8 @@ function isReservedAuthPath(pathname: string): boolean {
 function safeDecodeURIComponent(value: string): string | null {
   try {
     return decodeURIComponent(value);
-  } catch {
+  } catch (error) {
+    console.error("[auth] Failed to decode authenticated user name", error);
     return null;
   }
 }

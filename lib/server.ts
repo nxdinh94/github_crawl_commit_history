@@ -8,8 +8,14 @@ import type { ContributorStatus, CrawlStatus, RepositoryResult, Settings, Weekly
 
 export const DEFAULT_SETTINGS: Settings = { timezone: "Asia/Bangkok", shallowThreshold: 20, alertEmail: "", notificationsEnabled: true };
 
-export function errorMessage(error: unknown) { return error instanceof Error ? error.message : "Unexpected server error"; }
-export function jsonError(error: unknown, status = 500) { return Response.json({ error: errorMessage(error) }, { status }); }
+export function logError(context: string, error: unknown, details: Record<string, unknown> = {}) {
+  const loggedError = error instanceof Error
+    ? { name: error.name, message: error.message, stack: error.stack }
+    : error;
+  console.error(`[Commit Watch] ${context}`, { ...details, error: loggedError });
+}
+export function errorMessage(error: unknown) { return error instanceof Error ? error.message : typeof error === "string" ? error : "Unexpected server error"; }
+export function jsonError(error: unknown, status = 500, context = "API request failed") { logError(context, error); return Response.json({ error: errorMessage(error) }, { status }); }
 
 export async function readSettings(): Promise<Settings> {
   const db = getDb();
@@ -74,7 +80,11 @@ export async function sendAlertEmail(report: WeeklyReport, configured: Settings)
   const lines = flagged.map((item) => `- ${item.githubUsername}: ${item.status === "no_commit" ? "no commit" : item.status === "shallow" ? "shallow contribution" : "stats unavailable"}`).join("\n");
   const subject = `Commit Watch · ${report.weekStart.slice(0, 10)} weekly follow-up`;
   const response = await fetch("https://api.resend.com/emails", { method: "POST", headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ from: env.EMAIL_FROM, to: [configured.alertEmail], subject, text: `Weekly report ${report.weekStart.slice(0, 10)} — ${report.weekEnd.slice(0, 10)}\n\nStudents needing attention:\n${lines || "None"}\n\nOpen dashboard: ${baseUrl}` }) });
-  if (!response.ok) throw new Error(`Email provider returned ${response.status}.`);
+  if (!response.ok) {
+    const error = new Error(`Email provider returned ${response.status}.`);
+    logError("Alert email provider rejected the request", error, { status: response.status });
+    throw error;
+  }
   return { status: "sent" };
 }
 
@@ -110,6 +120,7 @@ export async function crawlWeek(weekStart: string, weekEnd: string, settingsValu
       repositoryResults.push({ repositoryId: repo.id, owner: repo.owner, name: repo.name, status: "completed", commitCount: commits.length, errorMessage: null });
       await db.insert(repositoryRuns).values({ id: `${runId}-${repo.id}`, crawlRunId: runId, repositoryId: repo.id, owner: repo.owner, name: repo.name, status: "completed", commitCount: commits.length });
     } catch (error) {
+      logError("Repository crawl failed", error, { owner: repo.owner, repository: repo.name });
       const message = errorMessage(error); errors.push(`${repo.owner}/${repo.name}: ${message}`);
       repositoryResults.push({ repositoryId: repo.id, owner: repo.owner, name: repo.name, status: "failed", commitCount: 0, errorMessage: message });
       await db.insert(repositoryRuns).values({ id: `${runId}-${repo.id}`, crawlRunId: runId, repositoryId: repo.id, owner: repo.owner, name: repo.name, status: "failed", commitCount: 0, errorMessage: message });
@@ -120,7 +131,7 @@ export async function crawlWeek(weekStart: string, weekEnd: string, settingsValu
   const status: CrawlStatus = errors.length ? (contributors.length ? "completed_with_errors" : "failed") : "completed";
   const snapshot: WeeklyReport = { id: runId, weekStart, weekEnd, status, threshold: settingsValue.shallowThreshold, contributors: contributors.map(({ hasMissingStats: _missing, ...item }) => item), repositoryResults, errorSummary: errors.length ? errors.join("\n") : null, notificationStatus: "not_sent" };
   let notificationStatus = "skipped";
-  if (status !== "completed" || contributors.some((item) => item.status !== "ok")) { try { notificationStatus = (await sendAlertEmail(snapshot, settingsValue)).status; } catch (error) { notificationStatus = `failed: ${errorMessage(error)}`; } }
+  if (status !== "completed" || contributors.some((item) => item.status !== "ok")) { try { notificationStatus = (await sendAlertEmail(snapshot, settingsValue)).status; } catch (error) { logError("Alert email failed", error); notificationStatus = `failed: ${errorMessage(error)}`; } }
   await db.update(crawlRuns).set({ status, completedAt: new Date().toISOString(), errorSummary: snapshot.errorSummary, notificationStatus }).where(eq(crawlRuns.id, runId));
   return { ...snapshot, notificationStatus };
 }
@@ -144,13 +155,26 @@ async function githubFetch(url: string) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const headers: Record<string, string> = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "commit-watch" };
     if (env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
-    const response = await fetch(url, { headers });
+    let response: Response;
+    try {
+      response = await fetch(url, { headers });
+    } catch (error) {
+      logError("GitHub network request failed", error, { url, attempt: attempt + 1 });
+      throw error;
+    }
     if (response.ok) return response;
-    if ((response.status === 429 || response.status === 403) && response.headers.get("retry-after")) await new Promise((resolve) => setTimeout(resolve, Math.min(Number(response.headers.get("retry-after")) * 1000, 5000)));
+    const retryAfter = response.headers.get("retry-after");
+    const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+    const rateLimitReset = response.headers.get("x-ratelimit-reset");
+    const error = new Error(`GitHub API returned ${response.status}.`);
+    logError("GitHub API request failed", error, { url, status: response.status, attempt: attempt + 1, retryAfter, rateLimitRemaining, rateLimitReset });
+    if ((response.status === 429 || response.status === 403) && retryAfter) await new Promise((resolve) => setTimeout(resolve, Math.min(Number(retryAfter) * 1000, 5000)));
     else if (response.status >= 500) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
-    else throw new Error(`GitHub API returned ${response.status}.`);
+    else throw error;
   }
-  throw new Error("GitHub API retry limit reached.");
+  const error = new Error("GitHub API retry limit reached.");
+  logError("GitHub API retry limit reached", error, { url });
+  throw error;
 }
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>) { const output: R[] = []; let cursor = 0; async function worker() { while (cursor < items.length) { const index = cursor++; output[index] = await mapper(items[index]); } } await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker())); return output; }
 

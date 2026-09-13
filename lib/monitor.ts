@@ -13,7 +13,7 @@ export function parseGitHubUrl(value: string): ParsedRepo | null {
     const name = parts[1].replace(/\.git$/, "").trim();
     if (!owner || !name || owner.includes(" ") || name.includes(" ")) return null;
     return { url: `https://github.com/${owner}/${name}`, owner, name };
-  } catch { return null; }
+  } catch (error) { console.error("[monitor] Failed to parse GitHub repository URL", error); return null; }
 }
 
 export function normalizeUsername(value: string) { return value.trim().replace(/^@/, "").toLowerCase(); }

@@ -6,7 +6,7 @@ import { jsonError } from "@/lib/server";
 
 export async function GET() {
   try { const rows = await getDb().select().from(rosterMembers).where(eq(rosterMembers.active, true)).orderBy(asc(rosterMembers.githubUsername)); return Response.json({ roster: rows }); }
-  catch (error) { return jsonError(error); }
+  catch (error) { return jsonError(error, 500, "GET /api/roster failed"); }
 }
 
 export async function PUT(request: Request) {
@@ -17,5 +17,5 @@ export async function PUT(request: Request) {
     await db.delete(rosterMembers);
     for (const githubUsername of usernames) await db.insert(rosterMembers).values({ id: `member-${githubUsername}`, githubUsername, active: true });
     return Response.json({ ok: true, count: usernames.length });
-  } catch (error) { return jsonError(error); }
+  } catch (error) { return jsonError(error, 500, "PUT /api/roster failed"); }
 }
