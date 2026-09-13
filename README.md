@@ -116,6 +116,8 @@ Replace the filename with the pending migration and `DB` with your D1 binding na
 - `npm run start`: preview the built Worker locally with D1/R2 support
 - `npm run db:generate`: generate Drizzle migrations after schema changes
 
+Public repositories are crawled through GitHub's unauthenticated API when `GITHUB_TOKEN` is not set. Configure a read-only token in the Site runtime environment when the workspace needs a higher API rate limit.
+
 When using the Sites plugin, follow its skill instructions for installation, builds, and publishing. These npm commands remain available for standalone use.
 
 The portable build runs Vinext directly without a host `timeout` command. The managed-linux build uses `scripts/build-verified.sh` and its existing `SITES_BUILD_TIMEOUT` setting.

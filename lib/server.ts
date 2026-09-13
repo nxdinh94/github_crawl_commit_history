@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { and, desc, eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { contributorSummaries, crawlRuns, repositoryRuns, settings } from "@/db/schema";
 import { classifyContribution, getPreviousWeekRange, normalizeUsername } from "@/lib/monitor";
@@ -58,7 +58,12 @@ export async function getReportList() {
 
 export function reportThreshold(report: WeeklyReport, threshold: number) { return { ...report, threshold }; }
 
-export function integrationStatus() { return { github: Boolean(env.GITHUB_TOKEN), email: Boolean(env.RESEND_API_KEY && env.EMAIL_FROM), database: Boolean(env.DB) }; }
+export function integrationStatus() {
+  // GitHub's unauthenticated API can read public repositories. A token is
+  // still useful for a higher rate limit, but it should not prevent a public
+  // repository from being crawled.
+  return { github: true, githubToken: Boolean(env.GITHUB_TOKEN), email: Boolean(env.RESEND_API_KEY && env.EMAIL_FROM), database: Boolean(env.DB) };
+}
 
 export function makeEmptyAggregate(githubUsername: string): CommitAggregate { return { githubUsername, commitCount: 0, latestCommitAt: null, additions: 0, deletions: 0, changedFiles: 0, hasMissingStats: false }; }
 
@@ -74,7 +79,6 @@ export async function sendAlertEmail(report: WeeklyReport, configured: Settings)
 }
 
 export async function crawlWeek(weekStart: string, weekEnd: string, settingsValue: Settings) {
-  if (!env.GITHUB_TOKEN) throw new Error("GITHUB_TOKEN is not configured. Add it to the Site runtime environment before running a crawl.");
   const db = getDb();
   const { repositories, rosterMembers } = await import("@/db/schema").then(async (schema) => ({ repositories: schema.repositories, rosterMembers: schema.rosterMembers }));
   const repoRows = await db.select().from(repositories).where(eq(repositories.active, true));
@@ -136,7 +140,18 @@ async function getCommits(owner: string, name: string, since: string, until: str
     return { githubUsername: author, date: item.commit?.author?.date || new Date().toISOString(), stats: details.stats && typeof details.stats.additions === "number" && typeof details.stats.deletions === "number" ? { additions: details.stats.additions, deletions: details.stats.deletions, changedFiles: typeof details.stats.total === "number" ? details.stats.total : 0 } : null };
   });
 }
-async function githubFetch(url: string) { for (let attempt = 0; attempt < 3; attempt += 1) { const response = await fetch(url, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "commit-watch" } }); if (response.ok) return response; if ((response.status === 429 || response.status === 403) && response.headers.get("retry-after")) await new Promise((resolve) => setTimeout(resolve, Math.min(Number(response.headers.get("retry-after")) * 1000, 5000))); else if (response.status >= 500) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1))); else throw new Error(`GitHub API returned ${response.status}.`); } throw new Error("GitHub API retry limit reached."); }
+async function githubFetch(url: string) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const headers: Record<string, string> = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "commit-watch" };
+    if (env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+    const response = await fetch(url, { headers });
+    if (response.ok) return response;
+    if ((response.status === 429 || response.status === 403) && response.headers.get("retry-after")) await new Promise((resolve) => setTimeout(resolve, Math.min(Number(response.headers.get("retry-after")) * 1000, 5000)));
+    else if (response.status >= 500) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+    else throw new Error(`GitHub API returned ${response.status}.`);
+  }
+  throw new Error("GitHub API retry limit reached.");
+}
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>) { const output: R[] = []; let cursor = 0; async function worker() { while (cursor < items.length) { const index = cursor++; output[index] = await mapper(items[index]); } } await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker())); return output; }
 
 export async function runPreviousWeek() { const configured = await readSettings(); const period = getPreviousWeekRange(new Date(), configured.timezone); return crawlWeek(period.weekStart, period.weekEnd, configured); }
